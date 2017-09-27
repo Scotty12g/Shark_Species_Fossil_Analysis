@@ -1,0 +1,297 @@
+---
+title: "Shark Tooth Morphology Analysis"
+output: html_notebook
+---
+
+### The Data Source
+As an undergraduate student minoring in Geology, I took a paleontology course my sophomore year - because what marine biologist wouldn't want to round out a dream discipline by dabbling in another? Through the course, students designed a final project that made use of the college fossil collections. To link the coursework to my main discipline, I chose to analyze fossilized shark tooth morphology, and what it might tell us about the diet of different groups of sharks (in my case, the Genus of each fossil). I measured the following for each tooth:
+
+**Empirical Measurements:**
+
+  * General tooth shape (rectangular vs triangular)
+  * Serrations (present vs absent)
+  * Root and Crown height (numeric)
+  * Root and Crown width (numeric)
+  * Tooth thickness (numeric)
+  * Lateral dentical (tiny projections on the tooth) height and width
+  * Downward force required for the tooth to puncture a piece of duct tape (numeric)
+
+**I also calculated the following standard morphological metrics:**
+
+  * Root volume (numeric)
+  * Crown volume (numeric)
+
+**And created a new  metric to quantify the tooth bredth:**
+
+  * $Crown Width : Crown Height$ Ratio (numeric; low to high = more pointy to more broad)
+
+
+I drew a variety of comparisons among the measures and metrics, and reported on what they implied about diets of different shark groups.
+
+
+### The Goal
+It occurred to me recently that this data set would be fun to play around with again, and so here it is! I started with the question *"How well do my measures and metrics separate shark teeth by Genus group?"*. In general, the data set is far too small to generate a terribly reliable classification model... but, we can use a classification model to tell us *"How well does tooth morphology distinguish shark groups?"* and *"How and why does the model misclassify groups?"*. So first, let's import the data and take a look at how messy it is (damn undergraduate me).
+
+#### Importing the messy data
+
+```{r, message=FALSE, warning=FALSE}
+sharktooth.dat<-read.csv("/Users/scottmorello/Dropbox/Archives/Personal/Random Analysis/Random_Personal_Work/shark_tooth_data.csv")
+head(sharktooth.dat)
+```
+
+#### Lookup and Fix the Genus information
+The data looks like it can use some cleaning, but first on the list is to check out the different groups (Genus) of sharks that we have, and ensure things look correct. Species/Genus names - especially extinct species - have a fun way of changing on you over the years as more data becomes available, or as scientists who are convinced a species belongs in one genus die, and a scientist who thinks otherwise takes his/her place in the academic hierarchy.
+
+We use the 'taxize' package to first look up each unique genus in the ITIS database. When we look at the output, we can see the levels of classification for a genus.
+
+```{r, message=TRUE, warning=FALSE}
+library("taxize")
+#Now look up all of the taxonomic info
+genus.names<-unique(sharktooth.dat$Genus)
+genus.itis <- classification(genus.names, db='itis')
+
+#example of classiicaitons for a genus
+genus.itis[1]
+
+```
+
+Unfortunately, when we summarize the entire output, we see that the genus Oxyrina could not be found.
+```{r, message=FALSE, warning=FALSE}
+summary(genus.itis)
+```
+
+
+So first, we look at the Oxyrina data, and try looking up an entire species name (i.e., genus and species), to see if that helps the ITIS search.
+```{r}
+#problem with "Oxyrina". What could it be?
+Oxyrina.taxa.dat<-unique(subset(sharktooth.dat,Genus=="Oxyrina")[,c("Genus","Species")])
+Oxyrina.taxa.dat
+
+#get the first species name
+Oxyrina.taxa.dat.1<-paste(as.matrix(Oxyrina.taxa.dat[1,]),collapse = " ")
+classification(Oxyrina.taxa.dat.1, db='itis')
+
+```
+
+The full species name didn't work either. Occasionally, a genus name might have different spellings, and so we search more generally by removing one letter at the end of the genus. When we search, ITIS returns multiple species that are close to what we asked for. Based on the listed common names, most of the species ITIS returns do not fit our criteria (e.g., they are skates or fish, and not sharks). The "shortfin mako,dientuso azul,mako" is the only shark in the list, and so we choose to link that taxonomic information to Oxyrina (#7 on the list). For the record, I did some sleuthing on my own, and found that Oxyrina is now classified under the Isurus genus (mako sharks), so the "taxize" package, combined with the ITIS database, did a pretty good job at sorting this out.
+```{r}
+library(stringr)
+#take the genus name, start at the first letter, and end at the second to last letter in the genus name length
+Oxyrina.taxa.dat.2<-str_sub(genus.names[length(genus.names)], 1, str_length(genus.names[length(genus.names)])-1)
+
+genus.itis.Oxyrina<-classification(Oxyrina.taxa.dat.2, db='itis')
+
+# I enter 7 manually to select the correct classiicaiton
+
+```
+
+#### Plot the Taxonomic Relationships Among Groups
+Great! We've fixed our taxonomy problem. We now update the Oxyrina genus with its up-to-date taxonomy, and we plot the taxonomic tree (relative distances among genus which reflect their evolutionary relatedness)
+```{r, message=FALSE, warning=FALSE}
+#Intert the new Genus
+sharktooth.dat$Genus[which(sharktooth.dat$Genus=="Oxyrina")]<-as.character(genus.itis.Oxyrina$Oxyrin[13,1])
+sharktooth.dat$Genus<-factor(sharktooth.dat$Genus)
+
+#reclassify
+genus.names<-unique(sharktooth.dat$Genus)
+genus.itis <- classification(genus.names, db='ncbi')
+
+genus.itis.tree <- class2tree(genus.itis)
+plot(genus.itis.tree)
+```
+
+#### Machine Learning to Classify Teeth to Genus using Tooth Morphology Data
+##### Cleaning the Data
+Now we get to the classification part! We're going to use a Random Forrest machine learning algorithm to try to sort out the groupings by genus. First, let's look at the morphological data and summarize it, so we know what cleaning needs to be done.
+```{r, message=FALSE, warning=FALSE}
+library("randomForest")
+library("caret")
+library("plyr")
+
+#look at the data and see what might be wrong with it for classiicaiton
+head(sharktooth.dat)
+
+#need to turn character vesctors into numbers, and numbers are currently factors.
+summary(sharktooth.dat)
+
+```
+
+
+Some items that need dealing with. First, we don't need a few columns that relate to the fossil number in the college collection, and the geologic period the fossil comes from. Also, we have a LOT of data on lateral denticals (tiny protrusions on the sides of the teeth). Lateral denticals aren't found on many of the other genus, so we just take one of the lateral dentical columns and turn it into presence/absence, rather than a continuous measurement.
+```{r}
+#we don't need the first two columns becasue they are age of fossil and the ID number, and we don't need columns 9-12 since all have to do with latteral denitical measurements, and not all species have the latteral denitcals. More useful to have a presnece absence, so first, remove all useless columns, but keep 1 lat dent column. Then let's make that into a binary varaible
+sharktooth.dat.sub<-sharktooth.dat[,-c(1,2,4,10:12)]
+sharktooth.dat.sub$Lateral.Dentical.Height.right..mm.<-as.character(sharktooth.dat.sub$Lateral.Dentical.Height.right..mm.)
+sharktooth.dat.sub[sharktooth.dat.sub$Lateral.Dentical.Height.right..mm.=="na","Lateral.Dentical.Height.right..mm."]<-"0"
+sharktooth.dat.sub[sharktooth.dat.sub$Lateral.Dentical.Height.right..mm.!="0","Lateral.Dentical.Height.right..mm."]<-"1"
+sharktooth.dat.sub$Lateral.Dentical.Height.right..mm.<-as.numeric(sharktooth.dat.sub$Lateral.Dentical.Height.right..mm.)
+
+```
+
+
+
+We also need to turn the other factors (e.g., shape, serrations) into binary variables, since we know from the summarized data (see above) that they all only have 2 levels. The column names are also pretty messy, so we clean those up too
+```{r, message=FALSE, warning=FALSE}
+#now to turn factors into binary variables, and make sure the rest are numeric
+for(i in 2:ncol(sharktooth.dat.sub)){sharktooth.dat.sub[,i]<-as.numeric(sharktooth.dat.sub[,i])}
+
+#these column names are pretty confusing, so lets clean them up
+colnames(sharktooth.dat.sub)
+
+colnames(sharktooth.dat.sub)<-c("genus","serrations","tooth_shape","crown_width","crown_height","lat_dent","root_height","root_width","thickness","puncture_force","enamel_volume","root_volume","crown_width_height_ratio")
+colnames(sharktooth.dat.sub)
+```
+
+##### Optimizing the Random Forrest Classificaiton
+For the Random Forrest classification, we need to optimize our parameters. As stated before, the data set is far too small for a training and test set of data, and even for generating a Random Forrest model that's terribly reliable for classification purposes. What we want the model to tell us is "how well does morphology distinguish shark groups, and when and how does it misclassify groups?". We start by fitting a Random Forrest model with the default parameter selection. This yields just over 71% accuracy in classification (i.e., $100-Error Rate$). Some group classification is more successful than others. The model defaults randomly tried 3 variables at each split (otherwise noted as "mtry"), and used 500 trees (otherwise noted as "ntree").
+```{r, message=FALSE, warning=FALSE}
+
+# the baseline random forrest model gives us just over 71% accruacy, so let's see if we can impoprove that. There probably isn't a LOT we can do, considering low sample sizes, but it's good practice
+sharktooth.rf <- randomForest(genus~.,data =sharktooth.dat.sub)
+sharktooth.rf
+
+```
+
+We can look at the importance of each morphological measure/variable in distinguishing among groups in the model. Obviously, some measures have much more influence than others.
+```{r, message=FALSE, warning=FALSE}
+#First, we can decide which variables are worth ditching by looking at their importance
+
+varImpPlot(sharktooth.rf)
+
+```
+
+Let's try to improve the classification accuracy by building the model with only the top 50% most important variables. We hold the mtry and ntree constant (3 and 500 respectively) to isolate the effect of the number of variables. The classification error is the same though... so no dice on improving the model there.
+```{r, message=FALSE, warning=FALSE}
+#we can take the top 50% of the most important variables and make a new formula with them
+importance.var<-rownames(importance(sharktooth.rf))[order(importance(sharktooth.rf),decreasing =TRUE)]
+importance.var.form<-as.formula(paste("genus ~ ", paste(importance.var[1:ceiling(length(importance.var)*.5)], collapse="+")))
+
+#then refit the model, but hold the mtry at 3 as it was before
+sharktooth.rf.sub <- randomForest(importance.var.form,data = sharktooth.dat.sub,mtry=3,ntree=500)
+
+# We can see that  the overall error stayed the same
+
+sharktooth.rf.sub
+```
+
+If we look more closely at the error rates, and distill them down to error by genus, we find that some genus classification errors improved while others decreased, yielding a net change of 0% improved accuracy.
+```{r, message=FALSE, warning=FALSE}
+# BUT, if we look more closely, the error by genus improved  in some while decreasing in others. Again, we have so few observatons that we might need as much data as possible for decent groupings in the model.
+
+errorchange.table<-data.frame(Genus=rownames(sharktooth.rf$confusion),All=sharktooth.rf$confusion[,"class.error"],Subset=sharktooth.rf.sub2$confusion[,"class.error"])
+errorchange.table$Change<-errorchange.table$Subset-errorchange.table$All
+
+library("ggplot2")
+ggplot(errorchange.table,aes(x=Genus,y=Change))+
+  geom_point(size = 3)+
+  geom_hline(yintercept=0,lty="dotted")+
+  ylab("Change in Error")+
+  theme_bw()
+
+```
+
+Let's settle on keeping all of the variables in the model, considering it doesn't really improve our classification error, and because we have such low sample sizes and could use all the data available. Instead, let's look at how the model parameters are affecting the accuracy by use repeated K-fold cross validation and cycling through multiple mtry (3-12) and ntree (100-500) values. We find that we can best optimize accuracy at just over 79% by using mtry=6 and ntree=500.
+```{r, message=FALSE, warning=FALSE}
+# Instead of experimenting with numbers of variables, let's keep all of them (becasue of our sample sizes) and look at how the model parameters are affecting the accruacy by use repeated K-fold cross validation and cycling through multiple mtry  (3-12) and ntree (100-500) values.
+
+for(n.tree in seq(100,500,100)){
+sharktooth.rf.temp<-train(genus ~ ., data = sharktooth.dat.sub, method = "rf", metric="Accuracy", tuneGrid= expand.grid(.mtry=c(3:12)),ntree=n.tree, trControl=trainControl(method="repeatedcv", number=10, repeats=3,search="grid"))
+
+if(n.tree==100){sharktooth.rf.test<-sharktooth.rf.temp$results}else{sharktooth.rf.test<-rbind(sharktooth.rf.test,sharktooth.rf.temp$results)}
+}
+sharktooth.rf.test$ntree<-factor(rep(seq(100,500,100),each=length(c(3:12))))
+
+#we can see that we get the best accruacy at mtry=6 and ntree=400, just under 79% accuracy
+
+ggplot(sharktooth.rf.test,aes(x=mtry,y=Accuracy,group=ntree,color=ntree))+
+  geom_point()+
+  geom_line()+
+  annotate("text",x=sharktooth.rf.test[which.max(sharktooth.rf.test$Accuracy),"mtry"],y=sharktooth.rf.test[which.max(sharktooth.rf.test$Accuracy),"Accuracy"]+.005,label=paste0("mtry=",sharktooth.rf.test[which.max(sharktooth.rf.test$Accuracy),"mtry"],", ntree=",sharktooth.rf.test[which.max(sharktooth.rf.test$Accuracy),"ntree"],", Accuracy=",round(sharktooth.rf.test[which.max(sharktooth.rf.test$Accuracy),"Accuracy"]*100,2),"%"))+
+  theme_bw()
+
+```
+
+##### Optimized Model Classification
+We update our model with the new values, and build a table showing the percent classification to each genus group, and then look at the percent classified correctly for each group (i.e. the table diagonal).
+```{r, message=FALSE, warning=FALSE}
+
+#so lets refit the model with the new mtry and ntree, and we manage to increase the accuracy to just over 74%
+mtry.new<-sharktooth.rf.test[which.max(sharktooth.rf.test$Accuracy),"mtry"]
+ntree.new<-as.numeric(levels(sharktooth.rf.test[which.max(sharktooth.rf.test$Accuracy),"ntree"])[as.numeric(sharktooth.rf.test[which.max(sharktooth.rf.test$Accuracy),"ntree"])])
+sharktooth.rf2 <- randomForest(genus~.,data = sharktooth.dat.sub, mtry=mtry.new, ntree=ntree.new)
+
+# Now lets look at the percent classified correctly and incorrectly
+shark.propclass<-prop.table(sharktooth.rf2$confusion[,-7],margin=1)
+shark.propclass
+
+diag(shark.propclass)
+
+```
+
+#### Is Evolutionary History Driving Genus Misclassification?
+So, our Random Forrest model is still misclassifying individual teeth by genus based on morphology. What could be influencing the misclassification? One obvious thing could be "shared derived characteristics" based on evolutionary history! Basically, things that share an evolutionary history share a common ancestor. Some morphological characteristics might not have changed much since that common ancestor, and so that would make, possibly tooth, morphologies somewhat similar, and difficult to distinguish between.
+
+To look at how evolutionary relatedness might affect our classifications, we extract the taxonomic distances (a measure of evolutionary similarity) among our genus from the taxonomic tree we built with the "taxize" package. Then, for each genus, we plot the percentage of classifications to each group (genus) in the Random Forrest model against each group's taxonomic distance. We also add a 1:1 line, to help visualize possible relationships, and plot the sample size used to train each genus grouping in the model in red.
+```{r, message=FALSE, warning=FALSE}
+
+#and see what could be influencing that. We get the taxonomic diustance from our data before, and then plot it agisint the RF classification percentage, which we use as a measure of "similarity" among Genus in the model.
+taxdist.mat<-(100-as.matrix(genus.itis.tree$distmat))/100
+
+library(reshape)
+shark.comp<-melt(shark.propclass)
+colnames(shark.comp)<-c("Actual","Comparison","RF_Classification")
+shark.comp$Taxanomic_Similarity<-melt(taxdist.mat)$value
+
+#Then we plot the ranfom forrest classificaiton percentage vs the taxonomic distance, and we do this for each genus, and even include the sample size of each genus that went into training the model
+
+library(ggplot2)
+ggplot(shark.comp,aes(x=Taxanomic_Similarity,y=RF_Classification,shape=Comparison))+
+  facet_wrap(~Actual)+
+  geom_point()+
+  geom_abline(slope=1,intercept=0,lty="dashed")+
+  scale_x_continuous(name="Taxonomic Similarity", limits=c(0,1))+
+  scale_y_continuous(name="Random Forrest Classification Percentage", limits=c(0,1))+
+  annotate("text", x=.5, y=.9, label= paste0("n = ",as.character(summary(sharktooth.dat.sub$genus))),colour = "red", fontface=2) +
+  theme_bw()
+  
+```
+
+
+We see two things in the graphs above. First, it looks like a genus classifies well with itself (i.e., 100% classification at 100% taxonomic similarity) only when sample sizes are high (e.g., 7 or 9). When sample sizes are lower, teeth morphologies classify to less taxonomically similar genus groups. We can quantitatively test this in a few ways. First, let's look at the relationship between correct Random Forrest classifications and sample size! Sample size explains a significant amount (~71%) of the variation in correct classifications, indicating that to improve the model, odds are we need greater sample sizes (duh).
+```{r, message=FALSE, warning=FALSE}
+samplesize.assign.lm<-lm(diag(shark.propclass)~summary(sharktooth.dat.sub$genus))
+summary(samplesize.assign.lm)
+```
+
+
+We can look at the relationship even more closely by  seeing how misclassification percentage (i.e., classification to an incorrect genus) relates to taxonomic similarity! We build a linear model to test how taxonomic similarity, sample size of the training set, and their interaction impact misclassification percentage. We find that taxonomic similarity can help explain misclassifications, but also that there is an interactive effect with sample size.
+```{r, message=FALSE, warning=FALSE}
+samplesize.vec<-as.numeric(summary(sharktooth.dat.sub$genus))[match(shark.comp$Actual[which(shark.comp$Taxanomic_Similarity!=1)],names(summary(sharktooth.dat.sub$genus)))]
+
+taxsim.assign.lm2<-lm(RF_Classification~Taxanomic_Similarity*samplesize.vec,data=shark.comp[which(shark.comp$Taxanomic_Similarity!=1),])
+
+summary(taxsim.assign.lm2)
+
+```
+
+To understand how the interaction between taxonomic similarity and sample size affects misclassifications, we model how misclassification percentage changes for sample sizes between 1 and 10, and from taxonomic similarity from 0 to 99% (since 100% similarity would not mean the tooth was misclassified). We see that if sample sizes are high when training a genus in the model, then a tooth from that genus won't misclassify very often - no matter the taxonomic similarity (lightest blue line). As sample size decreases when training a genus, however, misclassification increases, and teeth misclassify more readily to genus groups that are more taxonomically similar (black line)! Sort of expected, but pretty fun to see.
+```{r}
+
+#We can see this interactive effect by creating a set of sample data and predicting values with the model
+
+predict.assign<-data.frame(Taxanomic_Similarity=rep(seq(0.01,.99,.01),each=10), samplesize.vec=rep(c(1:10),times=99), RF_Classification=NA)
+predict.assign$RF_Classification<-predict(taxsim.assign.lm3,newdata=predict.assign)
+
+ggplot(predict.assign,aes(x=Taxanomic_Similarity,y=RF_Classification,group=samplesize.vec,color=samplesize.vec))+
+  geom_line(size=2)+
+  scale_x_continuous(name="Taxonomic Similarity", limits=c(-0.01,1.01))+
+  scale_y_continuous(name="Random Forrest Misclassification", limits=c(-0.01,1.01))+
+  scale_colour_gradient(name="Sample Size")+
+  theme_bw()
+```
+
+So there you go! We didn't really have enough of a sample size to build a functional classification model. BUT, with the data we did have, we were able to understand what ability we had to resolve genus by tooth morphology, and how taxonomic similarity and training sample sizes affected that ability! Hope you enjoyed the analysis!
+
+
+
+
